@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import sys
+
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+
+ALLOWED_EVENT_TYPES = ["view", "cart", "remove_from_cart", "purchase"]
+
+
+def add_quality_columns(df):
+    parsed_event_time = F.to_timestamp(
+        F.trim(F.col("event_time")), "yyyy-MM-dd HH:mm:ss z"
+    )
+
+    return df.withColumn("event_time_ts", parsed_event_time).withColumn(
+        "event_type_clean", F.lower(F.trim(F.col("event_type")))
+    ).withColumn(
+        "category_code_clean", F.lower(F.trim(F.col("category_code")))
+    ).withColumn(
+        "brand_clean", F.lower(F.trim(F.col("brand")))
+    ).withColumn(
+        "user_session_clean", F.trim(F.col("user_session"))
+    ).withColumn(
+        "quarantine_reason",
+        F.concat_ws(
+            "; ",
+            F.array(
+                # Preserve structurally malformed rows from landing ingestion
+                F.when(
+                    F.col("_corrupt_record").isNotNull(),
+                    F.lit("invalid_raw_record"),
+                ),
+                # Cannot establish a timeline without an event time
+                F.when(
+                    F.col("event_time_ts").isNull(), F.lit("invalid_event_time")
+                ),
+                # Cannot understand the action without an event type
+                F.when(
+                    F.col("event_type_clean").isNull()
+                    | (F.col("event_type_clean") == ""),
+                    F.lit("missing_event_type"),
+                ),
+                F.when(
+                    ~F.col("event_type_clean").isin(ALLOWED_EVENT_TYPES),
+                    F.lit("invalid_event_type"),
+                ),
+                # Cannot track product interactions without a product ID
+                F.when(
+                    F.col("product_id").isNull(), F.lit("missing_product_id")
+                ),
+                # Cannot track user journey without a session ID
+                F.when(
+                    F.col("user_session_clean").isNull()
+                    | (F.col("user_session_clean") == ""),
+                    F.lit("missing_user_session"),
+                ),
+                # Financial metrics will break with missing or negative prices
+                F.when(F.col("price").isNull(), F.lit("missing_price")),
+                F.when(F.col("price") < 0, F.lit("negative_price")),
+            ),
+        ),
+    )
+
+
+def split_valid_and_quarantine(df):
+    quarantined = df.filter(F.col("quarantine_reason") != "")
+    valid = df.filter(F.col("quarantine_reason") == "")
+    return valid, quarantined
+
+
+def main() -> None:
+    # Resolve job arguments dynamically from Glue parameters
+    args = getResolvedOptions(
+        sys.argv,
+        [
+            "JOB_NAME",
+            "BRONZE_INPUT_PATH",
+            "SILVER_OUTPUT_PATH",
+            "QUARANTINE_OUTPUT_PATH",
+        ],
+    )
+
+    bronze_input_path = args["BRONZE_INPUT_PATH"]
+    silver_output_path = args["SILVER_OUTPUT_PATH"]
+    quarantine_output_path = args["QUARANTINE_OUTPUT_PATH"]
+
+    sc = SparkContext()
+    glue_context = GlueContext(sc)
+    spark = glue_context.spark_session
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
+
+    bronze_df = spark.read.parquet(bronze_input_path)
+    cleaned_df = add_quality_columns(bronze_df)
+    valid_df, quarantine_df = split_valid_and_quarantine(cleaned_df)
+
+    silver_df = valid_df.select(
+        "event_time_ts",
+        "event_type_clean",
+        "product_id",
+        "category_id",
+        "category_code_clean",
+        "brand_clean",
+        "price",
+        "user_id",
+        "user_session_clean",
+        "run_id",
+        "ingest_ts",
+        "year",
+        "month",
+    )
+
+    silver_df.write.mode("overwrite").partitionBy("year", "month").parquet(
+        silver_output_path
+    )
+    print(f"Successfully populated Silver layer at {silver_output_path}")
+
+    q_count = quarantine_df.count()
+    if q_count > 0:
+        quarantine_df.write.mode("overwrite").partitionBy(
+            "year", "month"
+        ).parquet(quarantine_output_path)
+        print(f"Quarantined {q_count} records to {quarantine_output_path}")
+
+    job.commit()
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()
