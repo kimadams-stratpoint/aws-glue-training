@@ -1,1 +1,149 @@
+import sys
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
+# S3 location configs
+LANDING_PATH = "s3://s3-kim-capstone-training/raw-data/ecommerce/"
+BRONZE_OUTPUT_PATH = "s3://s3-kim-capstone-training/bronze/"
+
+# Explicit schema definition for raw CSV files
+SOURCE_SCHEMA = T.StructType(
+    [
+        T.StructField("event_time", T.StringType(), True),
+        T.StructField("event_type", T.StringType(), True),
+        T.StructField("product_id", T.LongType(), True),
+        T.StructField("category_id", T.LongType(), True),
+        T.StructField("category_code", T.StringType(), True),
+        T.StructField("brand", T.StringType(), True),
+        T.StructField("price", T.DoubleType(), True),
+        T.StructField("user_id", T.LongType(), True),
+        T.StructField("user_session", T.StringType(), True),
+        T.StructField("_corrupt_record", T.StringType(), True),
+    ]
+)
+
+
+def main() -> None:
+    # Resolve job arguments and initialize Glue/Spark environments
+    args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+
+    # Use the native Glue JOB_RUN_ID as the batch identifier instead of a hardcoded
+    # value, so every run is tagged uniquely without manual updates.
+    job_run_id = "unknown_run"
+    if "--JOB_RUN_ID" in sys.argv:
+        job_run_id = sys.argv[sys.argv.index("--JOB_RUN_ID") + 1]
+    BATCH_ID = job_run_id
+
+    sc = SparkContext()
+    glue_context = GlueContext(sc)
+    spark = glue_context.spark_session
+
+    # Allow Parquet schema merging in case new source columns appear over time
+    # (e.g. a column added to later CSV batches) without breaking the write.
+    spark.conf.set("spark.sql.parquet.mergeSchema", "true")
+
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
+
+    # --- Read raw landing CSV files via Glue's DynamicFrame reader ---
+    # Job Bookmarks only work through create_dynamic_frame (from_options / from_catalog).
+    # Plain spark.read.csv() bypasses Glue's file-tracking entirely, so it must be replaced here.
+    # transformation_ctx is REQUIRED and must be a stable, unique string across runs —
+    # this is the key Glue uses internally to persist bookmark state for this specific read.
+    #
+    # year/month are derived from each file's S3 path below (not from event_time,
+    # and not via Glue auto-inference — recurse=True disables that, see note below).
+    dyf = glue_context.create_dynamic_frame.from_options(
+        connection_type="s3",
+        connection_options={
+            "paths": [LANDING_PATH],
+            "recurse": True,
+            # groupFiles/groupSize optional - tune if you have many small files
+        },
+        format="csv",
+        format_options={
+            "withHeader": True,
+            "separator": ",",
+            "quoteChar": '"',
+            "escaper": '"',
+            "optimizePerformance": False,
+        },
+        transformation_ctx="landing_bookmark_ctx",  # must stay constant between runs
+    )
+
+    landing_df = dyf.toDF()
+
+    # IMPORTANT: connection_options={"recurse": True} makes Glue list files
+    # recursively as a flat set, which disables its automatic Hive-style
+    # partition-column inference from year=/month= folder names (unlike
+    # spark.read.csv on the same path). year/month must be extracted
+    # explicitly from each record's source file path instead.
+    landing_df = landing_df.withColumn(
+        "year", F.regexp_extract(F.input_file_name(), r"year=(\d+)", 1)
+    ).withColumn(
+        "month", F.regexp_extract(F.input_file_name(), r"month=(\d+)", 1)
+    )
+
+    # Glue's create_dynamic_frame CSV reader has no equivalent to Spark's
+    # columnNameOfCorruptRecord, so _corrupt_record is never populated here
+    # (unlike the original spark.read.csv approach). The Silver script depends
+    # on this column existing (to flag "invalid_raw_record" rows), so it must
+    # be added explicitly as an all-null column to preserve that contract.
+    # NOTE: this means Bronze will no longer actually capture malformed/corrupt
+    # rows the way it did before - if that detection matters, it needs a
+    # separate validation step, since Glue's reader silently drops bad rows
+    # rather than routing them into a corrupt-record column.
+    if "_corrupt_record" not in landing_df.columns:
+        landing_df = landing_df.withColumn(
+            "_corrupt_record", F.lit(None).cast(T.StringType())
+        )
+
+    # Enforce explicit schema after the fact (from_options infers types loosely,
+    # so casting to SOURCE_SCHEMA keeps your typed columns consistent).
+    # year/month are appended separately since they're derived path columns,
+    # not part of SOURCE_SCHEMA, but must survive this select for the
+    # partitioned write below.
+    cast_exprs = [
+        F.col(field.name).cast(field.dataType).alias(field.name)
+        for field in SOURCE_SCHEMA.fields
+        if field.name in landing_df.columns
+    ]
+    landing_df = landing_df.select(*cast_exprs, "year", "month")
+
+    # Guard: if this run picked up zero new files, bail out early rather than
+    # writing an empty batch or (worse) touching partitions with no new data.
+    if landing_df.rdd.isEmpty():
+        print("No new files found since last bookmark - nothing to process.")
+        job.commit()
+        spark.stop()
+        return
+
+    # Add ingestion audit metadata
+    bronze_df = landing_df.withColumn("run_id", F.lit(BATCH_ID)).withColumn(
+        "ingest_ts", F.current_timestamp()
+    )
+
+    # --- Write only the touched partitions, not the whole table ---
+    # Dynamic partition overwrite mode makes this write idempotent per-partition:
+    # it replaces data only in the year/month partitions present in this batch,
+    # leaving all other existing partitions untouched.
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
+    bronze_df.write.mode("overwrite").partitionBy("year", "month").parquet(
+        BRONZE_OUTPUT_PATH
+    )
+
+    print(f"Successfully updated Bronze layer at {BRONZE_OUTPUT_PATH} with new files only")
+
+    # Commit job run status to Glue's bookmark store — this is what actually
+    # persists "these files are now processed" so the next run skips them.
+    job.commit()
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()
