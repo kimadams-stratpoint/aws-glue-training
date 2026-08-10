@@ -22,8 +22,9 @@ Idempotent Partition Writes: Combined with dynamic partition overwrite mode, eac
 Path-Derived Partitioning: Because bookmark-mode ingestion lists source files individually rather than performing directory-level Hive partition discovery, year/month are derived explicitly per record from each file's S3 path (via input_file_name()), preserving the same partitioning contract Silver and Gold depend on.
 Downstream Schema Stability: A _corrupt_record column is preserved (populated as NULL when not natively supported by the reader) so Silver's existing quarantine logic continues to evaluate row structure without a breaking schema change.
 
-Strategic Database Segregation & Governance
-Decision: Co-locate Silver operational data and Quarantine tables within kim-capstone-glue-training, while isolating aggregated business datasets.
+Strategic Storage Segregation & Governance
+
+Decision: Store Landing, Bronze, Silver, and Quarantine data within a shared operational S3 bucket (s3-kim-capstone-training), with Quarantine implemented as a dedicated folder/prefix alongside Silver rather than a separate bucket or database. Gold-layer aggregated business datasets are isolated in a fully separate bucket.
 
 Justification:
 
